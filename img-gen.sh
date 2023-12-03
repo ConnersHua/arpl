@@ -4,35 +4,65 @@ set -e
 
 . scripts/func.sh
 
-if [ ! -d .buildroot ]; then
-  echo "Downloading buildroot"
-  git clone --single-branch -b 2023.02.x https://github.com/buildroot/buildroot.git .buildroot
-fi
+# Convert po2mo
+convertpo2mo "files/initrd/opt/rr/lang"
 
-# Convert po2mo, Get extractor, LKM, addons and Modules
-convertpo2mo "files/board/arpl/overlayfs/opt/arpl/lang"
-getExtractor "files/board/arpl/p3/extractor"
-getLKMs "files/board/arpl/p3/lkms" true
-getAddons "files/board/arpl/p3/addons" true
-getModules "files/board/arpl/p3/modules" true
+IMAGE_FILE="rr.img"
+gzip -dc "files/grub.img.gz" >"${IMAGE_FILE}"
+fdisk -l "${IMAGE_FILE}"
 
-# Remove old files
-rm -rf ".buildroot/output/target/opt/arpl"
-rm -rf ".buildroot/board/arpl/overlayfs"
-rm -rf ".buildroot/board/arpl/p1"
-rm -rf ".buildroot/board/arpl/p3"
+LOOPX=$(sudo losetup -f)
+sudo losetup -P "${LOOPX}" "${IMAGE_FILE}"
 
-# Copy files
+echo "Mounting image file"
+sudo rm -rf "/tmp/files/p1"
+sudo rm -rf "/tmp/files/p3"
+sudo mkdir -p "/tmp/files/p1"
+sudo mkdir -p "/tmp/files/p3"
+sudo mount ${LOOPX}p1 "/tmp/files/p1"
+sudo mount ${LOOPX}p3 "/tmp/files/p3"
+
+echo "Get Buildroot"
+[ ! -f "br/bzImage-rr" -o ! -f "br/initrd-rr" ] && getBuildroot "2023.08.x" "br"
+[ ! -f "br/bzImage-rr" -o ! -f "br/initrd-rr" ] && return 1
+
+read -p "Press enter to continue"
+
+echo "Repack initrd"
+sudo cp -f "br/bzImage-rr" "/tmp/files/p3/bzImage-rr"
+repackInitrd "br/initrd-rr" "files/initrd" "/tmp/files/p3/initrd-rr"
+
 echo "Copying files"
-VERSION=$(cat VERSION)
-sed 's/^ARPL_VERSION=.*/ARPL_VERSION="'${VERSION}'"/' -i files/board/arpl/overlayfs/opt/arpl/include/consts.sh
-echo "${VERSION}" >files/board/arpl/p1/ARPL-VERSION
-cp -Ru files/* .buildroot/
+sudo cp -Rf "files/p1/"* "/tmp/files/p1"
+sudo cp -Rf "files/p3/"* "/tmp/files/p3"
+# Get extractor, LKM, addons and Modules
+getLKMs "/tmp/files/p3/lkms" true
+getAddons "/tmp/files/p3/addons" true
+getModules "/tmp/files/p3/modules" true
+getExtractor "/tmp/files/p3/extractor"
 
-cd .buildroot
-echo "Generating default config"
-make BR2_EXTERNAL=./external -j$(nproc) arpl_defconfig
-echo "Version: ${VERSION}"
-echo "Building... Drink a coffee and wait!"
-make BR2_EXTERNAL=./external -j$(nproc)
-cd -
+sync
+
+# update.zip
+sha256sum update-list.yml update-check.sh >sha256sum
+zip -9j update.zip update-list.yml update-check.sh
+while read F; do
+  if [ -d "/tmp/${F}" ]; then
+    FTGZ="$(basename "/tmp/${F}").tgz"
+    tar -czf "${FTGZ}" -C "/tmp/${F}" .
+    sha256sum "${FTGZ}" >>sha256sum
+    zip -9j update.zip "${FTGZ}"
+    sudo rm -f "${FTGZ}"
+  else
+    (cd $(dirname "/tmp/${F}") && sha256sum $(basename "/tmp/${F}")) >>sha256sum
+    zip -9j update.zip "/tmp/${F}"
+  fi
+done < <(yq '.replace | explode(.) | to_entries | map([.key])[] | .[]' update-list.yml)
+zip -9j update.zip sha256sum
+
+
+echo "Unmount image file"
+sudo umount "/tmp/files/p1"
+sudo umount "/tmp/files/p3"
+
+sudo losetup --detach ${LOOPX}
